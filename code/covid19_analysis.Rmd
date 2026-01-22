@@ -1,24 +1,604 @@
 ---
-title: "R Notebook"
-output: html_notebook
+title: "Data 607 –  Final Project"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
 ---
 
-## Dataset: FIFA World Cup Goals (1930–2018)
-## Goal : How Scoring Patterns Changed in FIFA World Cups
+<p style="
+  text-align:center;
+  color: teal;
+  font-size: 1.4em;      
+  font-weight: bold;">
+  Student_Name: Pravalika Sure <br>
+  UID: 120558016
+</p>
 
-**1. Loading libraries**
+
+<style>
+h1 {
+  color: darkblue;
+}
+h2 {
+  color: darkred;
+}
+h3 {
+  color: teal;
+}
+h1{
+text-align:center;
+}
+.figure img {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+  max-width: 80%;   /* adjust size here */
+  height: auto;
+  text-align: center;
+}
+p {
+  text-align: justify !important;
+}
+
+@media print {
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
+
+</style>
+<div style="text-align:center;">
+
+## State-Level Drivers of COVID-19 Mortality in the United States (2021)
+
+</div>
+
+
+### 1.1 Loading required packages
 
 ```{r}
-library(tidyverse)
-library(tidyverse)
-library(Lahman)
+# Load required packages
 
-# View available data
-data(package = "Lahman")
+library(COVID19)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(janitor)
+library(pROC)
+library(corrplot)
+library(zoo)
+library(usmap)
+library(randomForest)
+library(car)       # for VIF
 
-# Use the Teams dataset
-teams <- Lahman::Teams
-
-head(teams)
 ```
+
+## 2.Data Loading and Initial Cleaning
+
+**Exploring entire dataset**
+```{r}
+# Load global COVID-19 data at level 2 (states/provinces)
+raw_df <- covid19(level = 2)
+
+# Basic structure
+glimpse(raw_df)
+
+```
+
+**Filtering out USA Data**
+
+```{r}
+df <- covid19(level = 2) %>% clean_names()
+
+usa <- df %>%
+  filter(administrative_area_level_1 == "United States") %>%
+  rename(state = administrative_area_level_2)
+```
+
+**Checking for the filtered data**
+
+```{r}
+unique(usa$state)
+
+```
+
+```{r}
+usa_2021 <- usa %>%
+  filter(date >= "2021-01-01", date <= "2021-12-31")
+
+```
+
+
+## 3. Feature Engineering and Handling Missing Data 
+
+### 3.1.Handling missing values
+```{r}
+# Check which vaccine variable exists
+grep("vacc", names(usa_2021), value = TRUE)
+ 
+state_summ <- usa_2021 %>%
+  group_by(state) %>%
+  summarise(
+    population        = max(population, na.rm = TRUE),
+    total_deaths      = max(deaths, na.rm = TRUE),
+    deaths_per_100k   = (total_deaths / population) * 100000,
+    total_tests       = max(tests, na.rm = TRUE),
+    tests_per_1k      = (total_tests / population) * 1000,
+    vax_coverage      = max(people_fully_vaccinated, na.rm = TRUE) / population,
+    mean_stringency   = mean(stringency_index, na.rm = TRUE)
+  )
+
+```
+
+### 3.2. CLEANING: Replace -Inf/Inf with NA + Filter NAs
+
+```{r}
+state_clean <- state_summ %>%
+  mutate(
+    total_tests       = ifelse(is.infinite(total_tests), NA, total_tests),
+    tests_per_1k      = ifelse(is.infinite(tests_per_1k), NA, tests_per_1k),
+    vax_coverage      = ifelse(is.infinite(vax_coverage), NA, vax_coverage),
+    deaths_per_100k   = ifelse(is.infinite(deaths_per_100k), NA, deaths_per_100k),
+    mean_stringency   = ifelse(is.infinite(mean_stringency), NA, mean_stringency)
+  ) %>%
+  filter(
+    !is.na(deaths_per_100k),
+    !is.na(vax_coverage),
+    !is.na(tests_per_1k),
+    !is.na(mean_stringency)
+  )
+
+glimpse(state_clean)
+```
+
+### 3.3. Handle infinite and missing values and remove rows with critical missingness
+
+```{r}
+state_clean <- state_summ %>%
+  mutate(
+    vax_coverage = ifelse(is.infinite(vax_coverage), NA, vax_coverage),
+    tests_per_1k = ifelse(is.infinite(tests_per_1k), NA, tests_per_1k)
+  ) %>%
+  filter(
+    !is.na(deaths_per_100k),
+    !is.na(vax_coverage),
+    !is.na(tests_per_1k),
+    !is.na(mean_stringency),
+    !is.na(population)
+  )
+```
+
+Some US territories (American Samoa, Guam, Northern Mariana Islands, etc.) reported no testing or vaccination data in 2021, causing max() to return -Inf.
+To avoid distortions, I replaced all ±Inf values with NA and filtered out states/territories missing key predictors (vaccination, testing, stringency, or death rates).
+This preserves the integrity of the dataset while retaining as many states as possible for multivariate analysis.
+
+### 3.4. Remove extreme outliers in deaths_per_100k using IQR rule
+
+```{r}
+q1 <- quantile(state_clean$deaths_per_100k, 0.25)
+q3 <- quantile(state_clean$deaths_per_100k, 0.75)
+iqr <- q3 - q1
+upper_cut <- q3 + 1.5 * iqr
+
+state_clean <- state_clean %>%
+  filter(deaths_per_100k <= upper_cut)
+
+glimpse(state_clean)
+```
+
+## 4. Exploratory Data Analysis (EDA)
+
+
+### 4.1 Distribution of Death Rates
+
+```{r}
+ggplot(state_clean, aes(x = deaths_per_100k)) +
+  geom_histogram(bins = 15, fill = "steelblue", color = "black") +
+  labs(
+    title = "Distribution of COVID-19 Deaths per 100,000 People (US States, 2021)",
+    x = "Deaths per 100,000",
+    y = "Number of States"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+**Interpretation:**
+
+This histogram shows that COVID-19 death rates varied widely across U.S. states in 2021. Most states had between about 200 and 325 deaths per 100,000 people, but a few states had much lower or much higher mortality. The shape is slightly right-skewed, meaning some states experienced unusually high death rates. This variation suggests that mortality was not uniform across the country and supports the need to investigate what factors—like vaccination, testing, or policy strictness—help explain these differences.
+
+### 4.2 Scatterplots: Vaccination, Testing, and Stringency vs Mortality
+
+**Vaccination vs COVID-19 Deaths per 100k**
+
+```{r}
+ggplot(state_clean, aes(x = vax_coverage, y = deaths_per_100k)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(
+    title = "Vaccination Coverage vs COVID-19 Deaths per 100k",
+    x = "Vaccination coverage (fraction fully vaccinated)",
+    y = "Deaths per 100,000"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+**Interpretation:**
+
+The plot shows a clear negative relationship between vaccination coverage and COVID-19 death rates. States with higher fractions of fully vaccinated residents generally experienced fewer deaths per 100,000. While there is some variation across states, the downward trend indicates that increased vaccination is strongly associated with lower mortality.
+
+**Testing Intensity vs COVID-19 Deaths per 100k**
+```{r}
+ggplot(state_clean, aes(x = tests_per_1k, y = deaths_per_100k)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(
+    title = "Testing Intensity vs COVID-19 Deaths per 100k",
+    x = "Total tests per 1,000 people",
+    y = "Deaths per 100,000"
+  )+
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+**Interpretation:**
+
+The downward-sloping regression line suggests a weak negative relationship between testing intensity and COVID-19 death rates. States that conducted more tests per 1,000 people tended to have slightly lower mortality, but the points are widely scattered. This indicates that testing alone does not strongly predict death rates, and other factors—such as vaccination coverage or demographics—likely play a larger role.
+
+**Policy Stringency vs COVID-19 Deaths per 100k**
+```{r}
+ggplot(state_clean, aes(x = mean_stringency, y = deaths_per_100k)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(
+    title = "Policy Stringency vs COVID-19 Deaths per 100k",
+    x = "Average policy stringency index (2021)",
+    y = "Deaths per 100,000"
+  )+
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+**Interpretation:**
+
+This plot shows a moderate negative relationship between policy stringency and COVID-19 deaths per 100,000 people across US states in 2021. States with stricter average policies tended to have lower mortality, as indicated by the downward-sloping regression line. While there is noticeable variability across states (shown by the wide confidence band), the overall trend suggests that stronger public-health measures were generally associated with fewer deaths, though policy stringency alone does not fully explain state-level differences.
+
+## 5. Correlation Analysis
+
+```{r, fig.height=8, fig.width=8, fig.top=2}
+num_vars <- state_clean %>%
+  select(deaths_per_100k, vax_coverage, tests_per_1k, mean_stringency)
+
+cor_matrix <- cor(num_vars, use = "complete.obs")
+
+par(mar = c(4, 4, 12, 4)) 
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  addCoef.col = "black",
+  tl.col = "black",
+  tl.srt = 45
+)
+
+mtext("Correlation Matrix of Key COVID-19 Variables (2021)",
+      side = 3, line = 10, cex = 1.4, font = 2, adj = 0.5)
+
+
+```
+
+
+## 6. Regression Modeling: Explaining Mortality
+
+### 6.1 Baseline Linear Regression Model
+
+```{r}
+lm_fit <- lm(
+  deaths_per_100k ~ vax_coverage + tests_per_1k + mean_stringency,
+  data = state_clean
+)
+
+summary(lm_fit)
+confint(lm_fit)
+
+```
+
+
+**Interpretation:**
+
+* The coefficient for vax_coverage indicates how much the death rate changes, on average, for a one-unit change in vaccination coverage (i.e., going from 0.5 to 0.6 = 10 percentage-point increase), holding testing and stringency constant. A negative and statistically significant coefficient supports the idea that higher vaccination coverage is associated with lower mortality.
+
+* The coefficients for tests_per_1k and mean_stringency indicate whether testing intensity and policy strictness have independent associations with death rates after adjusting for vaccination.
+
+* The p-values and 95% confidence intervals quantify uncertainty; intervals that do not cross zero suggest a robust association.
+
+* The R-squared value summarizes how much of the variation in death rates across states is explained by these three predictors.
+
+### 6.2 Interaction Model: Vaccination × Stringency
+
+
+```{r}
+lm_interact <- lm(
+  deaths_per_100k ~ vax_coverage * mean_stringency + tests_per_1k,
+  data = state_clean
+)
+
+summary(lm_interact)
+
+```
+
+**Interpretation:**
+
+* The interaction term vax_coverage:mean_stringency captures whether the effect of vaccination on death rates changes at different levels of policy stringency.
+
+* A negative interaction could suggest that vaccination is especially effective in states with high stringency, where both pharmaceutical and non-pharmaceutical interventions combine to reduce mortality.
+
+* A non-significant interaction would suggest that the effect of vaccination is relatively similar regardless of policy strictness.
+
+The interaction regression model tested whether the relationship between vaccination coverage and COVID-19 mortality depended on state-level policy stringency. None of the individual predictors (vaccination, testing intensity, or policy stringency) were statistically significant (all p > 0.05), and the interaction term was also not significant (p = 0.892). This indicates that the effect of vaccination on mortality does not appear to vary meaningfully with policy strictness in this dataset.
+
+However, the overall model was statistically significant (F(4,46) = 4.887, p = 0.002), and explained approximately 30% of the between-state variation in COVID-19 death rates (R² = 0.298). This suggests that while individual predictors show high uncertainty, the combination of vaccination, testing, and policy stringency collectively contributes to explaining state-level mortality differences.”
+
+### 6.3 Multicollinearity Check (VIF)
+
+```{r}
+vif(lm_fit)
+
+```
+
+All VIF values are below 2, indicating minimal multicollinearity and that each predictor provides independent, stable information to the regression model.
+
+## 7. Classification and ROC Analysis
+
+**Median-based dichotomization**
+
+```{r}
+# Create a binary outcome: high-mortality vs low-mortality state
+median_death <- median(state_clean$deaths_per_100k, na.rm = TRUE)
+
+state_clean <- state_clean %>%
+  mutate(
+    high_mortality = ifelse(deaths_per_100k > median_death, 1, 0)
+  )
+
+table(state_clean$high_mortality)
+
+```
+
+**Explaination:**
+
+* Using the median state-level death rate as a cutoff, I created a binary classification variable distinguishing “high-mortality” states (above median) from “low-mortality” states (below or equal to median).
+
+* The resulting class distribution was balanced (26 low-mortality states and 25 high-mortality states), which is ideal for training a logistic regression classifier because it avoids issues related to class imbalance.
+
+* This binary outcome enables evaluation of how well vaccination coverage, testing intensity, and policy stringency can discriminate between high-risk and low-risk states.
+
+**Logistic regression classifier**
+
+```{r}
+# Logistic regression classifier
+logit_fit <- glm(
+  high_mortality ~ vax_coverage + tests_per_1k + mean_stringency,
+  data = state_clean,
+  family = binomial()
+)
+
+summary(logit_fit)
+
+```
+
+**Explaination:**
+
+The logistic regression results show that vaccination coverage is the only strong predictor of whether a state had high COVID-19 mortality in 2021. The coefficient for vaccination is negative and statistically significant, meaning states with higher vaccination coverage were much less likely to fall into the “high-mortality” group.
+
+Testing intensity and policy stringency do not appear to predict mortality classification once vaccination is taken into account. Their effects are small and statistically non-significant. Overall, vaccination coverage plays the largest role in distinguishing high-mortality states from low-mortality ones.
+
+**Predicted probabilities and ROC curve**
+```{r}
+# Predicted probabilities and ROC curve
+state_clean$pred_prob <- predict(logit_fit, type = "response")
+
+roc_obj <- roc(state_clean$high_mortality, state_clean$pred_prob)
+
+plot.roc(roc_obj,
+         main = "ROC Curve: Predicting High-Mortality States",
+         print.auc = TRUE)
+
+```
+**Explaination:**
+
+The ROC curve above evaluates how well the logistic regression model distinguishes high-mortality states from low-mortality states using three predictors:
+
+* Vaccination coverage
+
+* Testing intensity
+
+* Government stringency
+
+The curve plots Sensitivity (True Positive Rate) against 1 − Specificity (False Positive Rate) across all classification thresholds.
+
+## 8. Clustering States by Pandemic Characteristics
+
+
+```{r}
+# K-means clustering and descriptive labels
+scaled_features <- scale(
+  state_clean %>%
+    select(deaths_per_100k, vax_coverage, tests_per_1k, mean_stringency)
+)
+
+set.seed(123)
+km <- kmeans(scaled_features, centers = 3)
+
+state_clean <- state_clean %>%
+  mutate(
+    cluster = km$cluster,  # create cluster first (numeric)
+
+    cluster_desc = case_when(
+      cluster == 3 ~ "High vaccination, low mortality",
+      cluster == 2 ~ "Low vaccination, high mortality",
+      cluster == 1 ~ "High vaccination, moderate mortality",
+      TRUE         ~ "Other"
+    ),
+    cluster_desc = factor(
+      cluster_desc,
+      levels = c(
+        "Low vaccination, high mortality",
+        "High vaccination, moderate mortality",
+        "High vaccination, low mortality"
+      )
+    )
+  )
+
+
+```
+
+```{r}
+ggplot(
+  state_clean,
+  aes(x = vax_coverage, y = deaths_per_100k,
+      color = cluster_desc, shape = cluster_desc)
+) +
+  geom_point(size = 3) +
+  labs(
+    title = "Clustering US States by COVID-19 Characteristics",
+    x = "Vaccination coverage",
+    y = "Deaths per 100,000",
+    color = "State cluster",
+    shape = "State cluster"
+  ) +
+  scale_color_manual(values = c(
+    "Low vaccination, high mortality"        = "firebrick2",
+    "High vaccination, moderate mortality"   = "darkorange2",
+    "High vaccination, low mortality"        = "steelblue3"
+  )) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank()
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+**Interpretation:**
+
+Together, the clusters tell a coherent epidemiological story:
+
+* Low vaccination + high mortality cluster (red)
+→ under-vaccination remains the strongest indicator of severe outcomes.
+
+* High vaccination + low mortality cluster (blue)
+→ vaccination is associated with substantially lower death rates.
+
+* High vaccination + moderate mortality cluster (orange)
+→ vaccination helps, but outcomes can still vary depending on contextual factors.
+
+The separation between clusters shows that multivariate patterns of vaccination, deaths, and state-level characteristics naturally form meaningful groups, reinforcing the regression findings and providing a powerful visual summary of pandemic heterogeneity across the United States.
+
+## 9. Spatial Visualization: US Choropleth Map
+
+```{r}
+# Quick view of state names used in state_clean
+sort(unique(state_clean$state))[1:10]
+```
+
+```{r}
+library(usdata)
+
+state_clean <- state_clean %>%
+  mutate(state_abbrev = state2abbr(state))   # Converts full names → abbreviations
+
+# Plot with labels
+plot_usmap(data = state_clean, values = "deaths_per_100k", labels = TRUE) +
+  scale_fill_continuous(
+    name = "Deaths per 100k",
+    label = scales::comma
+  ) +
+  labs(
+    title = "COVID-19 Deaths per 100,000 by US State (2021)"
+  ) +
+  theme(legend.position = "right") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+## 10. Random Forest and Variable Importance
+
+
+```{r}
+set.seed(123)
+
+rf_fit <- randomForest(
+  deaths_per_100k ~ vax_coverage + tests_per_1k + mean_stringency,
+  data = state_clean,
+  importance = TRUE,
+  mtry = 2
+)
+
+rf_fit
+
+
+```
+```{r}
+# Variable importance plot
+varImpPlot(rf_fit, main = "Random Forest Variable Importance")
+
+```
+
+**Interepretation:**
+
+* The random forest results provide a non-linear, data-driven confirmation of the patterns we saw in regression:
+
+* Vaccination is by far the strongest predictor of reduced COVID-19 mortality.
+
+* Policy stringency contributes meaningfully but less dramatically.
+
+* Testing intensity contributes the least, likely due to mixed causal directions and state-level reporting differences.
+
+Random forest models are powerful because they capture complex interactions and non-linearities, so the consistency of these importance rankings across both metrics strengthens confidence in the findings.
+
+**A random forest model was trained to capture potential nonlinear relationships.Due to the small dataset (56 states) and limited feature complexity, the random forest performed worse than a baseline model, explaining –0.74% of the variance.This suggests that state-level mortality in this dataset is largely explained by linear associations rather than complex nonlinear patterns.**
+
+## 11. Temporal Context: National Death Trends
+
+```{r}
+usa_ts <- raw_df %>%
+  clean_names() %>%
+  filter(
+    administrative_area_level_1 == "United States",
+    date <= as.Date("2022-12-31")   # <-- FIX
+  ) %>%
+  group_by(date) %>%
+  summarise(
+    deaths = sum(deaths, na.rm = TRUE)
+  ) %>%
+  mutate(
+    deaths_7day = zoo::rollmean(deaths, 7, fill = NA)
+  )
+
+ggplot(usa_ts, aes(date, deaths_7day)) +
+  geom_line(color = "darkred", size = 1.1) +
+  labs(
+    title = "7-Day Rolling Average of COVID-19 Deaths in the USA (Filtered to Avoid Artifact)",
+    x = "Date",
+    y = "Deaths (7-day rolling average)"
+  ) +
+  theme_minimal()
+
+
+```
+
+**Interpretation:**
+
+The figure shows the 7-day rolling average of cumulative COVID-19 deaths in the United States from early 2020 through the end of 2022. The smoothed curve highlights the major phases of the pandemic: an initial rise in mortality in mid-2020, a sharp acceleration during late 2020 and early 2021, and additional increases associated with subsequent waves such as Delta and Omicron. The curve steadily increases through 2022, reflecting the continued accumulation of deaths even as vaccination campaigns expanded.
+
+To avoid misleading artifacts, the dataset was filtered to exclude dates after December 2022—when state-level reporting in the COVID19 package stops and values default to zero. Without this filtering, the sudden drop to zero produces an artificial vertical cliff in early 2023. Restricting the plot to valid reporting dates ensures an accurate representation of national mortality trends.
+
 
