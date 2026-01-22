@@ -108,7 +108,6 @@ state-level-covid19-mortality/
 3. Knit the RMarkdown file to HTML or PDF
 
 📚 Academic Context
-
 Course: DATA 607 – Communication in Data Science and Analytics
 
 Institution: University of Maryland
